@@ -1,0 +1,18 @@
+# binaries
+wsgw_v1_lite
+*.exe
+*.dll
+*.so
+*.dylib
+
+# logs
+nohup.out
+*.log
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# go build cache artifacts (usually not here, but ok)
+*.test
