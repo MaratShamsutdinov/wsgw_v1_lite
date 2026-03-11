@@ -736,6 +736,12 @@ func main() {
 	var padTargetMax int
 	var padFirstMax int
 
+	// short HTTP request/response tunnel
+	var rrMode bool
+	var rrChunk int
+	var rrHold time.Duration
+	var rrTTL time.Duration
+
 	flag.StringVar(&listen, "listen", "127.0.0.1:5003", "HTTP listen address")
 	flag.StringVar(&path, "path", "/ws", "WebSocket path prefix")
 	flag.StringVar(&upstream, "upstream", "127.0.0.1:5000", "Upstream TCP address")
@@ -752,6 +758,11 @@ func main() {
 	flag.IntVar(&hexFrames, "hexFrames", 6, "Hexdump first N WS frames per direction (debug)")
 	flag.DurationVar(&slowWarn, "slowWriteWarn", 50*time.Millisecond, "Log write dt > this (debug). 0 disables")
 	flag.DurationVar(&slowCrit, "slowWriteCrit", 200*time.Millisecond, "Escalate to STALL if write dt > this (debug). 0 disables")
+
+	flag.BoolVar(&rrMode, "rr", false, "Enable short HTTP request/response tunnel mode on POST requests")
+	flag.IntVar(&rrChunk, "rrChunk", 4096, "Request/response tunnel max data bytes per HTTP exchange")
+	flag.DurationVar(&rrHold, "rrHold", 80*time.Millisecond, "Request/response tunnel hold time while waiting for upstream data")
+	flag.DurationVar(&rrTTL, "rrTTL", 90*time.Second, "Request/response tunnel idle session lifetime")
 
 	// inner framing flags
 	flag.BoolVar(&innerProto, "innerProto", false, "expect/send inner framing inside WS payload")
@@ -773,6 +784,19 @@ func main() {
 	}
 	if hexFrames < 0 {
 		hexFrames = 0
+	}
+
+	if rrChunk < 256 {
+		rrChunk = 256
+	}
+	if rrChunk > 65535 {
+		rrChunk = 65535
+	}
+	if rrHold < 0 {
+		rrHold = 0
+	}
+	if rrTTL <= 0 {
+		rrTTL = 90 * time.Second
 	}
 
 	// normalize inner knobs
@@ -826,6 +850,12 @@ func main() {
 		innerProto = true
 	}
 
+	var rrStore *rrSessionStore
+	if rrMode {
+		rrStore = newRRSessionStore(upstream, ioTimeout, rrChunk)
+		rrStore.startJanitor(rrTTL)
+	}
+
 	mux := http.NewServeMux()
 	var sidCtr uint64
 
@@ -836,6 +866,11 @@ func main() {
 		}
 
 		sid := fmt.Sprintf("%08x-%08x", atomic.AddUint64(&sidCtr, 1), uint32(time.Now().UnixNano()))
+
+		if rrMode && r.Method == http.MethodPost {
+			handleRRHTTP(w, r, sid, rrStore, rrHold)
+			return
+		}
 
 		// HTTP/2 WebSocket (RFC8441 extended CONNECT)
 		if isH2WebSocketConnect(r) {
@@ -1216,8 +1251,8 @@ func main() {
 		log.Printf("NOTE: For RFC8441 (HTTP/2 WebSocket) run with env: GODEBUG=http2xconnect=1")
 	}
 
-	log.Printf("wsgw_lite listening=%s path=%s upstream=%s ioTimeout=%s readLimit=%d frameMax=%d ping=%s innerProto=%v innerLenPad=%v lenPadMin=%d padMax=%d innerPingEvery=%s debug=%v hexN=%d hexFrames=%d slowWarn=%s slowCrit=%s tls=%v",
-		listen, path, upstream, ioTimeout, readLimit, frameMax, pingEvery, innerProto, innerLenPad, lenPadMin, padMax, innerPingEvery, debug, hexN, hexFrames, slowWarn, slowCrit, (tlsCert != ""))
+	log.Printf("wsgw_lite listening=%s path=%s upstream=%s ioTimeout=%s readLimit=%d frameMax=%d ping=%s innerProto=%v innerLenPad=%v lenPadMin=%d padMax=%d innerPingEvery=%s debug=%v hexN=%d hexFrames=%d slowWarn=%s slowCrit=%s tls=%v rr=%v rrChunk=%d rrHold=%s rrTTL=%s",
+		listen, path, upstream, ioTimeout, readLimit, frameMax, pingEvery, innerProto, innerLenPad, lenPadMin, padMax, innerPingEvery, debug, hexN, hexFrames, slowWarn, slowCrit, (tlsCert != ""), rrMode, rrChunk, rrHold, rrTTL)
 
 	if tlsCert != "" {
 		log.Fatal(srv.ListenAndServeTLS(tlsCert, tlsKey))
