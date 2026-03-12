@@ -853,7 +853,7 @@ func main() {
 	var rrStore *rrSessionStore
 	if rrMode {
 		rrStore = newRRSessionStore(upstream, ioTimeout, rrChunk)
-		rrStore.startJanitor(rrTTL)
+		// rrStore.startJanitor(rrTTL)
 	}
 
 	mux := http.NewServeMux()
