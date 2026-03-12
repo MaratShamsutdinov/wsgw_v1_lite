@@ -318,37 +318,10 @@ func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *r
 			n, readErr := sess.tcp.Read(buf)
 			_ = sess.tcp.SetReadDeadline(time.Time{})
 
-			total := n
-			if total > 0 {
-				// After the first useful read, briefly try to fill the same RR chunk.
-				// This reduces the number of POST/ACK cycles for bulk download.
-				const rrFillWait = 2 * time.Millisecond
-
-				for total < len(buf) {
-					_ = sess.tcp.SetReadDeadline(time.Now().Add(rrFillWait))
-					m, moreErr := sess.tcp.Read(buf[total:])
-					_ = sess.tcp.SetReadDeadline(time.Time{})
-
-					if m > 0 {
-						total += m
-					}
-
-					if moreErr != nil {
-						if ne, ok := moreErr.(net.Error); ok && ne.Timeout() {
-							break
-						}
-						readErr = moreErr
-						break
-					}
-
-					if m == 0 {
-						break
-					}
-				}
-
+			if n > 0 {
 				sess.nextSSeq++
 				sess.pendingSeq = sess.nextSSeq
-				sess.pendingData = append([]byte(nil), buf[:total]...)
+				sess.pendingData = append([]byte(nil), buf[:n]...)
 				resp.SSeq = sess.pendingSeq
 				resp.Data = append([]byte(nil), sess.pendingData...)
 			}
