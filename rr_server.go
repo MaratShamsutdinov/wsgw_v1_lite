@@ -17,8 +17,7 @@ const (
 	rrMagic0 byte = 'R'
 	rrMagic1 byte = 'R'
 
-	rrVersion1 byte = 1
-	rrVersion2 byte = 2
+	rrVersion byte = 1
 
 	rrFlagOpen  byte = 1 << 0
 	rrFlagClose byte = 1 << 1
@@ -29,7 +28,6 @@ type rrRequest struct {
 	SID   [16]byte
 	CSeq  uint32
 	CAck  uint32
-	CPoll uint32 // 0 => old ordered path; >0 => v2 downlink poll id
 	Data  []byte
 }
 
@@ -49,54 +47,31 @@ func decodeRRRequest(b []byte) (rrRequest, error) {
 	if b[0] != rrMagic0 || b[1] != rrMagic1 {
 		return req, errors.New("rr bad magic")
 	}
-
-	switch b[2] {
-	case rrVersion1:
-		req.Flags = b[3]
-		copy(req.SID[:], b[4:20])
-		req.CSeq = binary.BigEndian.Uint32(b[20:24])
-		req.CAck = binary.BigEndian.Uint32(b[24:28])
-		req.CPoll = 0
-
-		dataLen := int(binary.BigEndian.Uint16(b[28:30]))
-		if len(b) != 30+dataLen {
-			return req, fmt.Errorf("rr bad request length: have=%d want=%d", len(b), 30+dataLen)
-		}
-		if dataLen > 0 {
-			req.Data = append([]byte(nil), b[30:]...)
-		}
-		return req, nil
-
-	case rrVersion2:
-		if len(b) < 34 {
-			return req, fmt.Errorf("rr v2 request too short: %d", len(b))
-		}
-
-		req.Flags = b[3]
-		copy(req.SID[:], b[4:20])
-		req.CSeq = binary.BigEndian.Uint32(b[20:24])
-		req.CAck = binary.BigEndian.Uint32(b[24:28])
-		req.CPoll = binary.BigEndian.Uint32(b[28:32])
-
-		dataLen := int(binary.BigEndian.Uint16(b[32:34]))
-		if len(b) != 34+dataLen {
-			return req, fmt.Errorf("rr v2 bad request length: have=%d want=%d", len(b), 34+dataLen)
-		}
-		if dataLen > 0 {
-			req.Data = append([]byte(nil), b[34:]...)
-		}
-		return req, nil
-
-	default:
+	if b[2] != rrVersion {
 		return req, fmt.Errorf("rr bad version: %d", b[2])
 	}
+
+	req.Flags = b[3]
+	copy(req.SID[:], b[4:20])
+	req.CSeq = binary.BigEndian.Uint32(b[20:24])
+	req.CAck = binary.BigEndian.Uint32(b[24:28])
+
+	dataLen := int(binary.BigEndian.Uint16(b[28:30]))
+	if len(b) != 30+dataLen {
+		return req, fmt.Errorf("rr bad request length: have=%d want=%d", len(b), 30+dataLen)
+	}
+	if dataLen > 0 {
+		req.Data = append([]byte(nil), b[30:]...)
+	}
+
+	return req, nil
 }
 
 func encodeRRResponse(resp rrResponse) []byte {
 	out := make([]byte, 14+len(resp.Data))
 	out[0] = rrMagic0
 	out[1] = rrMagic1
-	out[2] = rrVersion1 // keep response wire unchanged for commit 1
+	out[2] = rrVersion
 	out[3] = resp.Flags
 	binary.BigEndian.PutUint32(out[4:8], resp.SAck)
 	binary.BigEndian.PutUint32(out[8:12], resp.SSeq)
@@ -109,11 +84,58 @@ func rrSIDString(sid [16]byte) string {
 	return hex.EncodeToString(sid[:])
 }
 
-const rrDLWindow = 2
+const rrServerLogMode = "baseline"
 
-type rrPollCacheEntry struct {
-	resp rrResponse
-	at   time.Time
+type rrServerSessionStats struct {
+	StartedAt   time.Time
+	Requests    int64
+	UpBytes     int64
+	DownBytes   int64
+	WriteErrs   int64
+	ReadErrs    int64
+	RemoteClose int64
+	ClientClose int64
+	CloseSent   int64
+	Non200      int64
+	OutOfOrder  int64
+	LastErr     string
+}
+
+func rrHumanBytes(n int64) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1fMB", float64(n)/float64(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1fKB", float64(n)/float64(1024))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func rrServerLogSummaryLocked(sidText string, sess *rrSession) {
+	if sess.summaryLogged {
+		return
+	}
+	sess.summaryLogged = true
+
+	log.Printf(
+		"rr sid=%s summary mode=%s dur=%s reqs=%d up=%s down=%s closeSent=%d clientClose=%d remoteClose=%d gone=%d outOfOrder=%d writeErrs=%d readErrs=%d non200=%d err=%q",
+		sidText,
+		rrServerLogMode,
+		time.Since(sess.stats.StartedAt),
+		sess.stats.Requests,
+		rrHumanBytes(sess.stats.UpBytes),
+		rrHumanBytes(sess.stats.DownBytes),
+		sess.stats.CloseSent,
+		sess.stats.ClientClose,
+		sess.stats.RemoteClose,
+		0,
+		sess.stats.OutOfOrder,
+		sess.stats.WriteErrs,
+		sess.stats.ReadErrs,
+		sess.stats.Non200,
+		sess.stats.LastErr,
+	)
 }
 
 type rrSession struct {
@@ -127,17 +149,14 @@ type rrSession struct {
 	lastCSeq uint32
 	nextSSeq uint32
 
-	// legacy v1 stop-and-wait downlink path
 	pendingSeq  uint32
 	pendingData []byte
 
-	// v2 downlink window path
-	pendingDL map[uint32][]byte           // SSeq -> payload, not cumulatively acked yet
-	pollCache map[uint32]rrPollCacheEntry // CPoll -> exact cached response
-	lastCPoll uint32
-
 	clientClosed bool
 	serverClosed bool
+
+	stats         rrServerSessionStats
+	summaryLogged bool
 }
 
 type rrSessionStore struct {
@@ -178,12 +197,14 @@ func (s *rrSessionStore) getOrCreate(sid [16]byte) (*rrSession, bool, error) {
 		return nil, false, err
 	}
 
+	now := time.Now()
 	sess := &rrSession{
-		sid:       sid,
-		tcp:       tcp,
-		lastSeen:  time.Now(),
-		pendingDL: make(map[uint32][]byte, rrDLWindow),
-		pollCache: make(map[uint32]rrPollCacheEntry, rrDLWindow*4),
+		sid:      sid,
+		tcp:      tcp,
+		lastSeen: now,
+		stats: rrServerSessionStats{
+			StartedAt: now,
+		},
 	}
 
 	s.mu.Lock()
@@ -210,153 +231,43 @@ func (s *rrSessionStore) remove(sid [16]byte) {
 	}
 }
 
-func rrCloneResponse(resp rrResponse) rrResponse {
-	out := resp
-	if len(resp.Data) > 0 {
-		out.Data = append([]byte(nil), resp.Data...)
-	}
-	return out
-}
-
-func rrAckLegacyPendingLocked(sess *rrSession, cack uint32) {
-	if sess.pendingSeq != 0 && cack >= sess.pendingSeq {
-		sess.pendingSeq = 0
-		sess.pendingData = nil
-	}
-}
-
-func rrAckWindowLocked(sess *rrSession, cack uint32) {
-	if cack == 0 {
-		return
-	}
-	for sseq := range sess.pendingDL {
-		if sseq <= cack {
-			delete(sess.pendingDL, sseq)
-		}
-	}
-}
-
-func rrTrimPollCacheLocked(sess *rrSession, cack uint32, cpoll uint32) {
-	if cpoll > sess.lastCPoll {
-		sess.lastCPoll = cpoll
-	}
-
-	for id, ent := range sess.pollCache {
-		// If its payload is already cumulatively acked, this cache entry is no longer useful.
-		if ent.resp.SSeq != 0 && ent.resp.SSeq <= cack {
-			delete(sess.pollCache, id)
-			continue
-		}
-
-		// Bound cache growth even for empty-poll responses.
-		if id+8 < sess.lastCPoll {
-			delete(sess.pollCache, id)
-		}
-	}
-}
-
-func rrAssignedSSeqLocked(sess *rrSession, sseq uint32) bool {
-	for _, ent := range sess.pollCache {
-		if ent.resp.SSeq == sseq {
-			return true
-		}
-	}
-	return false
-}
-
-func rrPickUnassignedDLLocked(sess *rrSession, cack uint32) (uint32, []byte, bool) {
-	var best uint32
-	var payload []byte
-
-	for sseq, data := range sess.pendingDL {
-		if sseq <= cack {
-			continue
-		}
-		if rrAssignedSSeqLocked(sess, sseq) {
-			continue
-		}
-		if best == 0 || sseq < best {
-			best = sseq
-			payload = data
-		}
-	}
-
-	if best == 0 {
-		return 0, nil, false
-	}
-	return best, payload, true
-}
-
-func rrFillOneDLLocked(sess *rrSession, store *rrSessionStore, rrHold time.Duration, sidText, reqID string) {
-	if sess.serverClosed {
-		return
-	}
-	if len(sess.pendingDL) >= rrDLWindow {
+func (s *rrSessionStore) startJanitor(ttl time.Duration) {
+	if ttl <= 0 {
 		return
 	}
 
-	buf := make([]byte, store.rrChunk)
-
-	deadline := time.Now()
-	if rrHold > 0 {
-		deadline = deadline.Add(rrHold)
-	}
-	_ = sess.tcp.SetReadDeadline(deadline)
-
-	n, readErr := sess.tcp.Read(buf)
-	_ = sess.tcp.SetReadDeadline(time.Time{})
-
-	if n > 0 {
-		sess.nextSSeq++
-		sess.pendingDL[sess.nextSSeq] = append([]byte(nil), buf[:n]...)
-	}
-
-	if readErr != nil {
-		if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-			return
-		}
-		sess.serverClosed = true
-		if !errors.Is(readErr, io.EOF) {
-			log.Printf("reqid=%s rr sid=%s upstream read err=%v", reqID, sidText, readErr)
-		}
-	}
-}
-
-func rrBuildPollRespLocked(sess *rrSession, req rrRequest, store *rrSessionStore, rrHold time.Duration, sidText, reqID string) rrResponse {
-	if ent, ok := sess.pollCache[req.CPoll]; ok {
-		return rrCloneResponse(ent.resp)
-	}
-
-	// Refresh window/cache against latest cumulative ack and newest poll id.
-	rrAckWindowLocked(sess, req.CAck)
-	rrTrimPollCacheLocked(sess, req.CAck, req.CPoll)
-
-	resp := rrResponse{
-		SAck: sess.lastCSeq,
-	}
-
-	if sseq, data, ok := rrPickUnassignedDLLocked(sess, req.CAck); ok {
-		resp.SSeq = sseq
-		resp.Data = append([]byte(nil), data...)
-	} else if !sess.serverClosed {
-		rrFillOneDLLocked(sess, store, rrHold, sidText, reqID)
-
-		if sseq, data, ok := rrPickUnassignedDLLocked(sess, req.CAck); ok {
-			resp.SSeq = sseq
-			resp.Data = append([]byte(nil), data...)
+	interval := 10 * time.Second
+	if ttl < interval {
+		interval = ttl / 2
+		if interval <= 0 {
+			interval = time.Second
 		}
 	}
 
-	if sess.serverClosed {
-		resp.Flags |= rrFlagClose
-	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
 
-	sess.pollCache[req.CPoll] = rrPollCacheEntry{
-		resp: rrCloneResponse(resp),
-		at:   time.Now(),
-	}
+		for range t.C {
+			var victims [][16]byte
 
-	return resp
+			s.mu.Lock()
+			for sid, sess := range s.sessions {
+				sess.mu.Lock()
+				stale := time.Since(sess.lastSeen) > ttl
+				sess.mu.Unlock()
+				if stale {
+					victims = append(victims, sid)
+				}
+			}
+			s.mu.Unlock()
+
+			for _, sid := range victims {
+				log.Printf("rr sid=%s cleanup ttl=%s", rrSIDString(sid), ttl)
+				s.remove(sid)
+			}
+		}
+	}()
 }
 
 func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *rrSessionStore, rrHold time.Duration) {
@@ -405,6 +316,10 @@ func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *r
 	} else {
 		sess = store.get(req.SID)
 		if sess == nil {
+			log.Printf(
+				"reqid=%s rr sid=%s gone remote=%s cseq=%d cack=%d flags=0x%02x",
+				reqID, sidText, r.RemoteAddr, req.CSeq, req.CAck, req.Flags,
+			)
 			http.Error(w, "rr session not found", http.StatusGone)
 			return
 		}
@@ -417,12 +332,11 @@ func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *r
 
 	sess.mu.Lock()
 	sess.lastSeen = time.Now()
+	sess.stats.Requests++
 
-	rrAckLegacyPendingLocked(sess, req.CAck)
-
-	if req.CPoll != 0 {
-		rrAckWindowLocked(sess, req.CAck)
-		rrTrimPollCacheLocked(sess, req.CAck, req.CPoll)
+	if sess.pendingSeq != 0 && req.CAck >= sess.pendingSeq {
+		sess.pendingSeq = 0
+		sess.pendingData = nil
 	}
 
 	if len(req.Data) > 0 {
@@ -432,14 +346,23 @@ func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *r
 				_ = sess.tcp.SetWriteDeadline(time.Now().Add(store.ioTimeout))
 			}
 			if err = writeFull(sess.tcp, req.Data); err != nil {
+				sess.stats.WriteErrs++
+				sess.stats.Non200++
+				sess.stats.LastErr = err.Error()
+				log.Printf("reqid=%s rr sid=%s upstream write err=%v", reqID, sidText, err)
 				fatalErr = fmt.Errorf("rr upstream write failed sid=%s: %w", sidText, err)
 				fatalStatus = http.StatusBadGateway
 				removeSession = true
 			} else {
 				sess.lastCSeq = req.CSeq
+				sess.stats.UpBytes += int64(len(req.Data))
 			}
 		case req.CSeq <= sess.lastCSeq:
 		default:
+			sess.stats.OutOfOrder++
+			sess.stats.Non200++
+			sess.stats.LastErr = fmt.Sprintf("rr out of order sid=%s cseq=%d last=%d", sidText, req.CSeq, sess.lastCSeq)
+			log.Printf("reqid=%s rr sid=%s out_of_order cseq=%d last=%d", reqID, sidText, req.CSeq, sess.lastCSeq)
 			fatalErr = fmt.Errorf("rr out of order sid=%s cseq=%d last=%d", sidText, req.CSeq, sess.lastCSeq)
 			fatalStatus = http.StatusConflict
 		}
@@ -447,55 +370,67 @@ func handleRRHTTP(w http.ResponseWriter, r *http.Request, reqID string, store *r
 
 	if fatalErr == nil && req.Flags&rrFlagClose != 0 && !sess.clientClosed {
 		sess.clientClosed = true
+		sess.stats.ClientClose++
 		if tc, ok := sess.tcp.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
 	}
 
 	if fatalErr == nil {
-		if req.CPoll != 0 {
-			resp = rrBuildPollRespLocked(sess, req, store, rrHold, sidText, reqID)
-		} else {
-			resp.SAck = sess.lastCSeq
+		resp.SAck = sess.lastCSeq
 
-			if sess.pendingSeq != 0 {
+		if sess.pendingSeq != 0 {
+			resp.SSeq = sess.pendingSeq
+			resp.Data = append([]byte(nil), sess.pendingData...)
+		} else if !sess.serverClosed {
+			buf := make([]byte, store.rrChunk)
+
+			deadline := time.Now()
+			if rrHold > 0 {
+				deadline = deadline.Add(rrHold)
+			}
+			_ = sess.tcp.SetReadDeadline(deadline)
+
+			n, readErr := sess.tcp.Read(buf)
+			_ = sess.tcp.SetReadDeadline(time.Time{})
+
+			if n > 0 {
+				sess.nextSSeq++
+				sess.pendingSeq = sess.nextSSeq
+				sess.pendingData = append([]byte(nil), buf[:n]...)
 				resp.SSeq = sess.pendingSeq
 				resp.Data = append([]byte(nil), sess.pendingData...)
-			} else if !sess.serverClosed {
-				buf := make([]byte, store.rrChunk)
+				sess.stats.DownBytes += int64(n)
+			}
 
-				deadline := time.Now()
-				if rrHold > 0 {
-					deadline = deadline.Add(rrHold)
-				}
-				_ = sess.tcp.SetReadDeadline(deadline)
-
-				n, readErr := sess.tcp.Read(buf)
-				_ = sess.tcp.SetReadDeadline(time.Time{})
-
-				if n > 0 {
-					sess.nextSSeq++
-					sess.pendingSeq = sess.nextSSeq
-					sess.pendingData = append([]byte(nil), buf[:n]...)
-					resp.SSeq = sess.pendingSeq
-					resp.Data = append([]byte(nil), sess.pendingData...)
-				}
-
-				if readErr != nil {
-					if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+			if readErr != nil {
+				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+				} else {
+					sess.serverClosed = true
+					if errors.Is(readErr, io.EOF) {
+						sess.stats.RemoteClose++
+						log.Printf("reqid=%s rr sid=%s remote close", reqID, sidText)
 					} else {
-						sess.serverClosed = true
-						if !errors.Is(readErr, io.EOF) {
-							log.Printf("reqid=%s rr sid=%s upstream read err=%v", reqID, sidText, readErr)
-						}
+						sess.stats.ReadErrs++
+						sess.stats.LastErr = readErr.Error()
+						log.Printf("reqid=%s rr sid=%s upstream read err=%v", reqID, sidText, readErr)
 					}
 				}
 			}
+		}
 
-			if sess.serverClosed {
-				resp.Flags |= rrFlagClose
+		if sess.serverClosed {
+			resp.Flags |= rrFlagClose
+			if sess.stats.CloseSent == 0 {
+				sess.stats.CloseSent++
+				log.Printf("reqid=%s rr sid=%s send close sseq=%d", reqID, sidText, resp.SSeq)
+				rrServerLogSummaryLocked(sidText, sess)
 			}
 		}
+	}
+
+	if fatalErr != nil && removeSession {
+		rrServerLogSummaryLocked(sidText, sess)
 	}
 
 	sess.mu.Unlock()
